@@ -1,0 +1,20 @@
+{
+  "output_json": "../outputs/gh_summary.json",
+  "plot_path": "../outputs/gh_center_trend.png",
+  "refinement_mode": "algebraic_then_geometric",
+  "compare_refinement_modes": true,
+  "noise_levels": [
+    0.003,
+    0.008,
+    0.02
+  ],
+  "repeats": 2,
+  "seed": 31,
+  "scene": {
+    "contour_noise_sigma": 0.12,
+    "contour_samples_per_observation": 48,
+    "num_circles": 2,
+    "num_views": 10,
+    "rotation_noise_sigma_deg": 0.35
+  }
+}

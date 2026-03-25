@@ -1,0 +1,23 @@
+.venv/
+.uv-cache/
+.matplotlib/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+*.pyc
+*.pyo
+*.pyd
+
+build/
+dist/
+*.egg-info/
+
+# Experiment artifacts and local examples
+outputs/
+examples/
+artifacts/
+
+short-term-memory/
+
+.DS_Store
