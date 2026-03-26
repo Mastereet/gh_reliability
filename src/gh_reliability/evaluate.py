@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -66,8 +67,8 @@ def _rotation_error_degrees(first: np.ndarray, second: np.ndarray) -> float:
     return float(np.degrees(relative.magnitude()))
 
 
-def fit_scene_ellipses(scene: SceneData, point_sigma: float) -> list[list[EllipseFitResult]]:
-    contour_points = np.asarray(scene.observations["contour_points"], dtype=np.float64)
+def _fit_contour_stack(contour_points: np.ndarray, point_sigma: float) -> list[list[EllipseFitResult]]:
+    contour_points = np.asarray(contour_points, dtype=np.float64)
     return [
         [
             fit_ellipse_with_covariance(contour_points[circle_index, view_index], point_sigma=point_sigma)
@@ -77,11 +78,27 @@ def fit_scene_ellipses(scene: SceneData, point_sigma: float) -> list[list[Ellips
     ]
 
 
+def fit_scene_ellipses(scene: SceneData, point_sigma: float) -> list[list[EllipseFitResult]]:
+    return _fit_contour_stack(scene.observations["contour_points"], point_sigma=point_sigma)
+
+
+def fit_dual_scene_ellipses(
+    scene: SceneData,
+    point_sigma: float,
+) -> tuple[list[list[EllipseFitResult]], list[list[EllipseFitResult]]]:
+    return (
+        _fit_contour_stack(scene.observations["contour_points_outer"], point_sigma=point_sigma),
+        _fit_contour_stack(scene.observations["contour_points_inner"], point_sigma=point_sigma),
+    )
+
+
 def reconstruct_scene_for_validation(
     scene: SceneData,
     ellipse_results: list[list[EllipseFitResult]],
     camera_center_sigma: float,
     refinement_mode: str = "algebraic_then_geometric",
+    reconstruction_mode: str = "outer_only",
+    inner_ellipse_results: list[list[EllipseFitResult]] | None = None,
 ) -> list[Any]:
     """Run the real 3D reconstruction path used by the validation prototype."""
     return reconstruct_scene(
@@ -89,6 +106,8 @@ def reconstruct_scene_for_validation(
         ellipse_results=ellipse_results,
         camera_center_sigma=camera_center_sigma,
         refinement_mode=refinement_mode,
+        reconstruction_mode=reconstruction_mode,
+        inner_ellipse_results=inner_ellipse_results,
     )
 
 
@@ -327,6 +346,132 @@ def save_noise_sweep_plot(
 
     for axis in axes[-1]:
         axis.set_xlabel("camera-center noise sigma")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=160)
+    plt.close(fig)
+
+
+def summarize_fastpaper_trends(
+    noise_levels: Iterable[float],
+    repeated_circle_summaries: list[list[list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    trend_summary = summarize_noise_trends(noise_levels, repeated_circle_summaries)
+    per_circle = trend_summary["per_circle"]
+    if not per_circle:
+        return {
+            "camera_center_noise_levels": list(trend_summary["camera_center_noise_levels"]),
+            "repeat_count": int(trend_summary["repeat_count"]),
+            "center_error_mean": [],
+            "center_error_mean_raw": [],
+            "center_error_mean_monotone": [],
+            "normal_angle_mean_degrees": [],
+            "normal_angle_mean_degrees_raw": [],
+            "normal_angle_mean_degrees_monotone": [],
+            "radius_error_mean": [],
+            "radius_error_mean_raw": [],
+            "radius_error_mean_monotone": [],
+            "convergence_rate": [],
+        }
+
+    def _mean_series(key: str) -> list[float]:
+        stacked = np.asarray([circle[key] for circle in per_circle], dtype=np.float64)
+        return np.mean(stacked, axis=0).astype(np.float64).tolist()
+
+    center_error_mean_raw = _mean_series("center_error_mean_raw")
+    normal_angle_mean_degrees_raw = _mean_series("normal_angle_mean_degrees_raw")
+    radius_error_mean_raw = _mean_series("radius_error_mean_raw")
+
+    return {
+        "camera_center_noise_levels": list(trend_summary["camera_center_noise_levels"]),
+        "repeat_count": int(trend_summary["repeat_count"]),
+        "center_error_mean": center_error_mean_raw,
+        "center_error_mean_raw": center_error_mean_raw,
+        "center_error_mean_monotone": _mean_series("center_error_mean"),
+        "normal_angle_mean_degrees": normal_angle_mean_degrees_raw,
+        "normal_angle_mean_degrees_raw": normal_angle_mean_degrees_raw,
+        "normal_angle_mean_degrees_monotone": _mean_series("normal_angle_mean_degrees"),
+        "radius_error_mean": radius_error_mean_raw,
+        "radius_error_mean_raw": radius_error_mean_raw,
+        "radius_error_mean_monotone": _mean_series("radius_error_mean"),
+        "convergence_rate": _mean_series("convergence_rate"),
+        "per_circle": per_circle,
+    }
+
+
+def save_fastpaper_result_table(
+    results: dict[str, dict[str, dict[str, Any]]],
+    *,
+    table_path: str | Path,
+) -> None:
+    table_path = Path(table_path)
+    table_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with table_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "scenario",
+                "method",
+                "camera_center_noise_sigma",
+                "center_error_mean",
+                "normal_angle_mean_degrees",
+                "radius_error_mean",
+                "convergence_rate",
+            ),
+        )
+        writer.writeheader()
+        for scenario, scenario_results in results.items():
+            for method, result_bundle in scenario_results.items():
+                trend_summary = result_bundle["trend_summary"]
+                for level, center_error, normal_angle, radius_error, convergence_rate in zip(
+                    trend_summary["camera_center_noise_levels"],
+                    trend_summary["center_error_mean"],
+                    trend_summary["normal_angle_mean_degrees"],
+                    trend_summary["radius_error_mean"],
+                    trend_summary["convergence_rate"],
+                    strict=True,
+                ):
+                    writer.writerow(
+                        {
+                            "scenario": scenario,
+                            "method": method,
+                            "camera_center_noise_sigma": float(level),
+                            "center_error_mean": float(center_error),
+                            "normal_angle_mean_degrees": float(normal_angle),
+                            "radius_error_mean": float(radius_error),
+                            "convergence_rate": float(convergence_rate),
+                        }
+                    )
+
+
+def save_fastpaper_profile_plot(
+    scenario_results: dict[str, dict[str, Any]],
+    *,
+    metric_key: str,
+    plot_path: str | Path,
+    title: str,
+    ylabel: str,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    plot_path = Path(plot_path)
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.0))
+    for method, result_bundle in scenario_results.items():
+        trend_summary = result_bundle["trend_summary"]
+        levels = np.asarray(trend_summary["camera_center_noise_levels"], dtype=np.float64)
+        values = np.asarray(trend_summary[metric_key], dtype=np.float64)
+        ax.plot(levels, values, marker="o", linewidth=2.0, label=method)
+
+    ax.set_title(title)
+    ax.set_xlabel("camera-center noise sigma")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(plot_path, dpi=160)
     plt.close(fig)

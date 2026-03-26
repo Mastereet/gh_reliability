@@ -26,6 +26,14 @@ scripts/run_validation_uv.sh --config configs/gh_scene_config.json
 
 That configuration writes artifacts into `outputs/`.
 
+The fast-paper dual-circle profile uses:
+
+```bash
+scripts/run_validation_uv.sh --config configs/dual_circle_fastpaper.json
+```
+
+That profile writes the summary JSON, comparison CSV, and plot artifacts into `outputs/dual_circle_fastpaper/`.
+
 ## Development Workflow
 
 - Use the repo-local `AGENTS.md` instructions for task workflow.

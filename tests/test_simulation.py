@@ -15,15 +15,21 @@ def test_generate_scene_returns_deterministic_two_circle_three_view_schema():
     assert np.array_equal(first.cameras["camera_centers_true"], second.cameras["camera_centers_true"])
     assert np.array_equal(first.observations["camera_centers_noisy"], second.observations["camera_centers_noisy"])
     assert np.array_equal(first.observations["contour_points"], second.observations["contour_points"])
+    assert np.array_equal(first.observations["contour_points_outer"], second.observations["contour_points_outer"])
+    assert np.array_equal(first.observations["contour_points_inner"], second.observations["contour_points_inner"])
 
     assert first.circles["centers"].shape == (2, 3)
     assert first.circles["normals"].shape == (2, 3)
     assert first.circles["radii"].shape == (2,)
+    assert first.circles["outer_radii"].shape == (2,)
+    assert first.circles["inner_radii"].shape == (2,)
     assert first.cameras["intrinsics"].shape == (3, 3)
     assert first.cameras["rotations"].shape == (3, 3, 3)
     assert first.cameras["camera_centers_true"].shape == (3, 3)
     assert first.observations["camera_centers_noisy"].shape == (3, 3)
     assert first.observations["contour_points"].shape == (2, 3, 64, 2)
+    assert first.observations["contour_points_outer"].shape == (2, 3, 64, 2)
+    assert first.observations["contour_points_inner"].shape == (2, 3, 64, 2)
     assert first.observations["projected_centers"].shape == (2, 3, 2)
 
     assert first.metadata["num_circles"] == 2
@@ -34,6 +40,7 @@ def test_generate_scene_returns_deterministic_two_circle_three_view_schema():
     assert first.metadata["camera_noise_model"] == "gaussian_camera_center_noise"
     assert first.metadata["contour_noise_model"] == "gaussian_image_noise"
     assert "local_simulation_choices" in first.metadata
+    assert np.array_equal(first.circles["radii"], first.circles["outer_radii"])
 
 
 def test_generate_scene_supports_requested_circle_and_view_counts():
@@ -105,3 +112,41 @@ def test_generate_scene_accepts_explicit_pose_config_and_emits_pose_covariances(
     assert scene.metadata["rotation_noise_model"] == "gaussian_axis_angle_noise"
     assert np.allclose(scene.observations["pose_covariances"][:, :3, :3], (0.004**2) * np.eye(3), atol=1e-12)
     assert np.min(np.linalg.eigvalsh(scene.observations["pose_covariances"][0])) >= -1e-12
+
+
+def test_generate_scene_rejects_conflicting_or_ambiguous_circle_radius_inputs():
+    try:
+        generate_scene(
+            scene_config={
+                "circles": [
+                    {
+                        "center": [0.0, 0.0, 4.5],
+                        "normal": [0.0, 0.0, 1.0],
+                        "radius": 0.6,
+                        "outer_radius": 0.7,
+                    }
+                ]
+            }
+        )
+    except ValueError as exc:
+        assert "radius" in str(exc)
+    else:  # pragma: no cover - red/green assertion
+        raise AssertionError("expected ValueError for conflicting radius fields")
+
+    try:
+        generate_scene(
+            scene_config={
+                "circles": [
+                    {
+                        "center": [0.0, 0.0, 4.5],
+                        "normal": [0.0, 0.0, 1.0],
+                        "radius": 0.6,
+                        "inner_radius": 0.4,
+                    }
+                ]
+            }
+        )
+    except ValueError as exc:
+        assert "inner_radius" in str(exc)
+    else:  # pragma: no cover - red/green assertion
+        raise AssertionError("expected ValueError for ambiguous inner_radius input")

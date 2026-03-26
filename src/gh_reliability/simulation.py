@@ -20,29 +20,54 @@ class SceneData:
 def _parse_circle_configuration(
     scene_config: dict[str, Any] | None,
     num_circles: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _parse_dual_radius(circle: dict[str, Any]) -> tuple[float, float]:
+        has_radius = "radius" in circle
+        has_outer_radius = "outer_radius" in circle
+        has_inner_radius = "inner_radius" in circle
+
+        if has_inner_radius and not has_outer_radius:
+            raise ValueError("circle inner_radius requires explicit outer_radius")
+
+        if has_outer_radius:
+            outer_radius = float(circle["outer_radius"])
+            if has_radius and not np.isclose(float(circle["radius"]), outer_radius):
+                raise ValueError("circle radius and outer_radius must match when both are provided")
+            inner_radius = float(circle.get("inner_radius", 0.72 * outer_radius))
+        else:
+            outer_radius = float(circle["radius"])
+            inner_radius = 0.72 * outer_radius
+        if outer_radius <= 0.0:
+            raise ValueError("circle outer radius must be positive")
+        if inner_radius <= 0.0:
+            raise ValueError("circle inner radius must be positive")
+        if inner_radius >= outer_radius:
+            raise ValueError("circle inner radius must be smaller than outer radius")
+        return outer_radius, inner_radius
+
     if scene_config is not None and "circles" in scene_config:
         circles = list(scene_config["circles"])
         if not circles:
             raise ValueError("scene_config circles must be non-empty")
         centers = []
         normals = []
-        radii = []
+        outer_radii = []
+        inner_radii = []
         for circle in circles:
             center = np.asarray(circle["center"], dtype=np.float64)
             normal = normalize_vector(np.asarray(circle["normal"], dtype=np.float64))
-            radius = float(circle["radius"])
             if center.shape != (3,):
                 raise ValueError("each circle center must have shape (3,)")
-            if radius <= 0.0:
-                raise ValueError("circle radius must be positive")
+            outer_radius, inner_radius = _parse_dual_radius(circle)
             centers.append(center)
             normals.append(normal)
-            radii.append(radius)
+            outer_radii.append(outer_radius)
+            inner_radii.append(inner_radius)
         return (
             np.asarray(centers, dtype=np.float64),
             np.asarray(normals, dtype=np.float64),
-            np.asarray(radii, dtype=np.float64),
+            np.asarray(outer_radii, dtype=np.float64),
+            np.asarray(inner_radii, dtype=np.float64),
         )
 
     if num_circles <= 0:
@@ -76,8 +101,9 @@ def _parse_circle_configuration(
         ],
         axis=0,
     )
-    circle_radii = (0.52 + 0.07 * (circle_indices % 4) + 0.015 * np.floor(circle_indices / 4.0)).astype(np.float64)
-    return circle_centers, circle_normals, circle_radii
+    circle_outer_radii = (0.52 + 0.07 * (circle_indices % 4) + 0.015 * np.floor(circle_indices / 4.0)).astype(np.float64)
+    circle_inner_radii = (0.72 * circle_outer_radii).astype(np.float64)
+    return circle_centers, circle_normals, circle_outer_radii, circle_inner_radii
 
 
 def _parse_intrinsics(scene_config: dict[str, Any] | None) -> np.ndarray:
@@ -116,20 +142,42 @@ def _parse_camera_configuration(
         raise ValueError("num_views must be at least 3 for stable reconstruction")
 
     cameras = None if scene_config is None else scene_config.get("cameras")
+    scenario = None if scene_config is None else scene_config.get("scenario")
+    if scenario is not None and scenario not in {"near_coplanar", "non_coplanar"}:
+        raise ValueError("scene_config scenario must be one of: near_coplanar, non_coplanar")
     rotation_noise_sigma_rad = float(np.deg2rad(rotation_noise_sigma_deg))
     translation_covariance = (float(camera_center_noise_sigma) ** 2) * np.eye(3, dtype=np.float64)
     rotation_covariance = (rotation_noise_sigma_rad**2) * np.eye(3, dtype=np.float64)
 
     if cameras is None:
         view_angles = np.linspace(0.0, 2.0 * np.pi, num_views, endpoint=False, dtype=np.float64)
-        camera_centers_true = np.stack(
-            [
-                0.95 * np.cos(view_angles),
-                0.42 * np.sin(view_angles),
-                0.18 * np.sin(2.0 * view_angles),
-            ],
-            axis=1,
-        ).astype(np.float64)
+        if scenario == "near_coplanar":
+            camera_centers_true = np.stack(
+                [
+                    0.95 * np.cos(view_angles),
+                    0.42 * np.sin(view_angles),
+                    0.02 * np.sin(2.0 * view_angles),
+                ],
+                axis=1,
+            ).astype(np.float64)
+        elif scenario == "non_coplanar":
+            camera_centers_true = np.stack(
+                [
+                    0.92 * np.cos(view_angles),
+                    0.38 * np.sin(view_angles),
+                    0.34 + 0.24 * np.sin(2.0 * view_angles),
+                ],
+                axis=1,
+            ).astype(np.float64)
+        else:
+            camera_centers_true = np.stack(
+                [
+                    0.95 * np.cos(view_angles),
+                    0.42 * np.sin(view_angles),
+                    0.18 * np.sin(2.0 * view_angles),
+                ],
+                axis=1,
+            ).astype(np.float64)
         rotations_true = np.stack([look_at_rotation(center, target) for center in camera_centers_true], axis=0)
         center_perturbations = np.zeros_like(camera_centers_true)
         rotation_perturbations = np.zeros_like(camera_centers_true)
@@ -191,7 +239,9 @@ def generate_scene(
     scene_config: dict[str, Any] | None = None,
 ) -> SceneData:
     rng = np.random.default_rng(seed)
-    circle_centers, circle_normals, circle_radii = _parse_circle_configuration(scene_config, num_circles)
+    circle_centers, circle_normals, circle_outer_radii, circle_inner_radii = _parse_circle_configuration(
+        scene_config, num_circles
+    )
     intrinsics = _parse_intrinsics(scene_config)
     target = circle_centers.mean(axis=0)
     (
@@ -211,28 +261,41 @@ def generate_scene(
     num_circles = int(circle_centers.shape[0])
     num_views = int(camera_centers_true.shape[0])
 
-    contour_points = np.empty((num_circles, num_views, contour_samples_per_observation, 2), dtype=np.float64)
+    contour_points_outer = np.empty((num_circles, num_views, contour_samples_per_observation, 2), dtype=np.float64)
+    contour_points_inner = np.empty((num_circles, num_views, contour_samples_per_observation, 2), dtype=np.float64)
     projected_centers = np.empty((num_circles, num_views, 2), dtype=np.float64)
 
     for circle_index in range(num_circles):
         center = circle_centers[circle_index]
         normal = circle_normals[circle_index]
-        radius = circle_radii[circle_index]
+        outer_radius = circle_outer_radii[circle_index]
+        inner_radius = circle_inner_radii[circle_index]
         center_world = center[None, :]
         for view_index in range(num_views):
             rotation = rotations_true[view_index]
             camera_center = camera_centers_true[view_index]
-            contour = project_circle_contour(
+            outer_contour = project_circle_contour(
                 center=center,
                 normal=normal,
-                radius=radius,
+                radius=outer_radius,
                 intrinsics=intrinsics,
                 rotation=rotation,
                 camera_center=camera_center,
                 num_samples=contour_samples_per_observation,
             )
-            contour += rng.normal(scale=contour_noise_sigma, size=contour.shape)
-            contour_points[circle_index, view_index] = contour
+            inner_contour = project_circle_contour(
+                center=center,
+                normal=normal,
+                radius=inner_radius,
+                intrinsics=intrinsics,
+                rotation=rotation,
+                camera_center=camera_center,
+                num_samples=contour_samples_per_observation,
+            )
+            outer_contour += rng.normal(scale=contour_noise_sigma, size=outer_contour.shape)
+            inner_contour += rng.normal(scale=contour_noise_sigma, size=inner_contour.shape)
+            contour_points_outer[circle_index, view_index] = outer_contour
+            contour_points_inner[circle_index, view_index] = inner_contour
             projected_centers[circle_index, view_index] = project_points(
                 center_world,
                 intrinsics=intrinsics,
@@ -269,6 +332,7 @@ def generate_scene(
             "contour_noise_sigma": contour_noise_sigma,
             "num_circles": int(num_circles),
             "num_views": int(num_views),
+            "scenario": None if scene_config is None else scene_config.get("scenario"),
             "projection_source": "ground-truth circles projected with true camera centers, then perturbed in image space",
         },
     }
@@ -277,7 +341,9 @@ def generate_scene(
         circles={
             "centers": circle_centers,
             "normals": circle_normals,
-            "radii": circle_radii,
+            "radii": circle_outer_radii,
+            "outer_radii": circle_outer_radii,
+            "inner_radii": circle_inner_radii,
         },
         cameras={
             "intrinsics": intrinsics,
@@ -288,7 +354,9 @@ def generate_scene(
         observations={
             "camera_centers_noisy": camera_centers_noisy,
             "pose_covariances": pose_covariances,
-            "contour_points": contour_points,
+            "contour_points": contour_points_outer,
+            "contour_points_outer": contour_points_outer,
+            "contour_points_inner": contour_points_inner,
             "projected_centers": projected_centers,
         },
         metadata=metadata,

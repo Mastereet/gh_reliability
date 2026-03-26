@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from gh_reliability.run import run_noise_sweep
+from gh_reliability.run import run_dual_circle_fastpaper, run_noise_sweep
 
 REFINEMENT_MODES = ("algebraic_only", "geometric_only", "algebraic_then_geometric")
+FASTPAPER_PROFILE = "dual_circle_fastpaper"
+KNOWN_EXPERIMENT_PROFILES = {FASTPAPER_PROFILE}
 
 
 def _parse_noise_levels(value: str) -> list[float]:
@@ -74,8 +76,49 @@ def _resolve_config_relative_path(config_path: Path, raw_path: str | None) -> Pa
     return config_path.parent / candidate
 
 
-def _parse_run_request_from_config(config_path: Path) -> tuple[Path, dict[str, Any]]:
+def _parse_run_request_from_config(config_path: Path) -> tuple[str | None, Path, dict[str, Any]]:
     payload = json.loads(config_path.read_text())
+    experiment_profile = payload.get("experiment_profile")
+    if experiment_profile is not None and experiment_profile not in KNOWN_EXPERIMENT_PROFILES:
+        known_profiles = ", ".join(sorted(KNOWN_EXPERIMENT_PROFILES))
+        raise ValueError(f"unknown experiment_profile '{experiment_profile}'; expected one of: {known_profiles}")
+    if experiment_profile == FASTPAPER_PROFILE:
+        output_dir = _resolve_config_relative_path(config_path, payload.get("output_dir"))
+        if output_dir is None:
+            raise ValueError("config must define output_dir")
+        output_json_raw = payload.get("output_json")
+        if output_json_raw is None:
+            raise ValueError("config must define output_json")
+        output_json_path = Path(str(output_json_raw))
+        output_json = output_json_path if output_json_path.is_absolute() else output_dir / output_json_path
+
+        scene_section = dict(payload.get("scene", payload.get("scene_config", {})))
+        contour_samples = scene_section.pop(
+            "contour_samples_per_observation",
+            scene_section.pop("contour_samples", 72),
+        )
+        contour_noise_sigma = scene_section.pop("contour_noise_sigma", 0.2)
+        num_circles = scene_section.pop("num_circles", 1)
+        num_views = scene_section.pop("num_views", 5)
+        rotation_noise_sigma_deg = scene_section.pop("rotation_noise_sigma_deg", 0.0)
+        refinement_mode = payload.get("refinement_mode", "algebraic_then_geometric")
+        if refinement_mode not in REFINEMENT_MODES:
+            raise ValueError(f"refinement_mode must be one of: {', '.join(REFINEMENT_MODES)}")
+
+        return FASTPAPER_PROFILE, output_json, {
+            "noise_levels": payload.get("noise_levels", [0.0, 0.005, 0.01, 0.02, 0.03]),
+            "repeats": int(payload.get("repeats", 10)),
+            "contour_noise_sigma": float(contour_noise_sigma),
+            "contour_samples_per_observation": int(contour_samples),
+            "num_circles": int(num_circles),
+            "num_views": int(num_views),
+            "rotation_noise_sigma_deg": float(rotation_noise_sigma_deg),
+            "refinement_mode": refinement_mode,
+            "seed": int(payload.get("seed", 20260327)),
+            "output_dir": output_dir,
+            "scene_config": scene_section or None,
+        }
+
     output_json_raw = payload.get("output_json")
     if output_json_raw is None:
         raise ValueError("config must define output_json")
@@ -118,7 +161,7 @@ def _parse_run_request_from_config(config_path: Path) -> tuple[Path, dict[str, A
     output_json = _resolve_config_relative_path(config_path, str(output_json_raw))
     if output_json is None:
         raise ValueError("config must define output_json")
-    return output_json, run_kwargs
+    return experiment_profile, output_json, run_kwargs
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -126,8 +169,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
+        experiment_profile = None
         if args.config is not None:
-            output_json, run_kwargs = _parse_run_request_from_config(args.config)
+            experiment_profile, output_json, run_kwargs = _parse_run_request_from_config(args.config)
         else:
             if args.output_json is None:
                 parser.error("--output-json is required unless --config is provided")
@@ -148,7 +192,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    summary = run_noise_sweep(**run_kwargs)
+    if experiment_profile == FASTPAPER_PROFILE:
+        summary = run_dual_circle_fastpaper(**run_kwargs)
+    else:
+        summary = run_noise_sweep(**run_kwargs)
 
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_json.write_text(json.dumps(summary, indent=2, sort_keys=True))

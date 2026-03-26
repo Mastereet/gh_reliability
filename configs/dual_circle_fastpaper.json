@@ -1,0 +1,22 @@
+{
+  "experiment_profile": "dual_circle_fastpaper",
+  "output_dir": "../outputs/dual_circle_fastpaper",
+  "output_json": "summary.json",
+  "noise_levels": [
+    0.0,
+    0.005,
+    0.01,
+    0.02,
+    0.03
+  ],
+  "repeats": 10,
+  "seed": 20260327,
+  "refinement_mode": "algebraic_then_geometric",
+  "scene": {
+    "contour_noise_sigma": 0.1,
+    "contour_samples_per_observation": 48,
+    "rotation_noise_sigma_deg": 0.0,
+    "num_circles": 1,
+    "num_views": 5
+  }
+}

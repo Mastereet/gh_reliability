@@ -383,6 +383,36 @@ def _normalized_dual_vec5(dual_conic: np.ndarray, floor: float = 1e-12) -> np.nd
     return _vec5_from_dual_conic_matrix(dual_conic) / scale
 
 
+def _validate_ellipse_result_layout(
+    ellipse_results: list[list[EllipseFitResult]],
+    *,
+    num_circles: int,
+    num_views: int,
+    label: str,
+) -> None:
+    if len(ellipse_results) != num_circles:
+        raise ValueError(f"{label} must match ellipse_results with shape ({num_circles}, {num_views})")
+    for circle_index, circle_results in enumerate(ellipse_results):
+        if len(circle_results) != num_views:
+            raise ValueError(
+                f"{label} must match ellipse_results with shape ({num_circles}, {num_views}); "
+                f"circle {circle_index} has {len(circle_results)} views"
+            )
+
+
+def _dual_branch_scaled_normals(
+    scaled_normal: np.ndarray,
+    radius_ratio: float,
+    reconstruction_mode: str,
+) -> tuple[np.ndarray, ...]:
+    scaled_normal = np.asarray(scaled_normal, dtype=np.float64)
+    if reconstruction_mode == "outer_only":
+        return (scaled_normal,)
+    if reconstruction_mode == "dual_joint":
+        return (scaled_normal, float(radius_ratio) * scaled_normal)
+    raise ValueError("reconstruction_mode must be 'outer_only' or 'dual_joint'")
+
+
 def _joint_residual_vector(
     state: np.ndarray,
     *,
@@ -391,10 +421,14 @@ def _joint_residual_vector(
     intrinsics: np.ndarray,
     observed_centers: np.ndarray,
     observed_rotvecs: np.ndarray,
-    observed_duals: np.ndarray,
+    observed_duals_outer: np.ndarray,
+    observed_duals_inner: np.ndarray | None,
+    radius_ratios: np.ndarray,
+    reconstruction_mode: str,
     center_whiteners: np.ndarray,
     rotation_whiteners: np.ndarray,
-    dual_whiteners: np.ndarray,
+    dual_whiteners_outer: np.ndarray,
+    dual_whiteners_inner: np.ndarray | None,
 ) -> np.ndarray:
     circle_states, pose_centers, pose_rotvecs = _unpack_joint_state(state, num_circles=num_circles, num_views=num_views)
     residuals: list[np.ndarray] = []
@@ -406,16 +440,35 @@ def _joint_residual_vector(
     for circle_index in range(num_circles):
         center = circle_states[circle_index, :3]
         scaled_normal = circle_states[circle_index, 3:]
-        for view_index in range(num_views):
-            matrix_m = intrinsics @ Rotation.from_rotvec(pose_rotvecs[view_index]).as_matrix()
-            predicted_dual = _projected_dual_conic_matrix(
-                center,
-                scaled_normal,
-                matrix_m=matrix_m,
-                camera_center=pose_centers[view_index],
-            )
-            raw_residual = _vec5_from_dual_conic_matrix(predicted_dual) - predicted_dual[2, 2] * observed_duals[circle_index, view_index]
-            residuals.append(dual_whiteners[circle_index, view_index] @ raw_residual)
+        branch_scaled_normals = _dual_branch_scaled_normals(
+            scaled_normal,
+            radius_ratio=radius_ratios[circle_index],
+            reconstruction_mode=reconstruction_mode,
+        )
+        branch_observed_duals = [observed_duals_outer[circle_index]]
+        branch_whiteners = [dual_whiteners_outer[circle_index]]
+        if reconstruction_mode == "dual_joint":
+            assert observed_duals_inner is not None
+            assert dual_whiteners_inner is not None
+            branch_observed_duals.append(observed_duals_inner[circle_index])
+            branch_whiteners.append(dual_whiteners_inner[circle_index])
+
+        for branch_scaled_normal, branch_observed, branch_whitener in zip(
+            branch_scaled_normals,
+            branch_observed_duals,
+            branch_whiteners,
+            strict=True,
+        ):
+            for view_index in range(num_views):
+                matrix_m = intrinsics @ Rotation.from_rotvec(pose_rotvecs[view_index]).as_matrix()
+                predicted_dual = _projected_dual_conic_matrix(
+                    center,
+                    branch_scaled_normal,
+                    matrix_m=matrix_m,
+                    camera_center=pose_centers[view_index],
+                )
+                raw_residual = _vec5_from_dual_conic_matrix(predicted_dual) - predicted_dual[2, 2] * branch_observed[view_index]
+                residuals.append(branch_whitener[view_index] @ raw_residual)
 
     return np.concatenate(residuals, axis=0)
 
@@ -446,7 +499,10 @@ def _joint_geometric_residual_vector(
     intrinsics: np.ndarray,
     observed_centers: np.ndarray,
     observed_rotvecs: np.ndarray,
-    contour_points: np.ndarray,
+    contour_points_outer: np.ndarray,
+    contour_points_inner: np.ndarray | None,
+    radius_ratios: np.ndarray,
+    reconstruction_mode: str,
     point_sigma: float,
     center_whiteners: np.ndarray,
     rotation_whiteners: np.ndarray,
@@ -461,22 +517,37 @@ def _joint_geometric_residual_vector(
     for circle_index in range(num_circles):
         center = circle_states[circle_index, :3]
         scaled_normal = circle_states[circle_index, 3:]
-        for view_index in range(num_views):
-            matrix_m = intrinsics @ Rotation.from_rotvec(pose_rotvecs[view_index]).as_matrix()
-            predicted_dual = _projected_dual_conic_matrix(
-                center,
-                scaled_normal,
-                matrix_m=matrix_m,
-                camera_center=pose_centers[view_index],
-            )
-            point_conic = _point_conic_from_dual(predicted_dual)
-            residuals.append(
-                _sampson_point_residuals(
-                    point_conic,
-                    contour_points[circle_index, view_index],
-                    point_sigma=point_sigma,
+        branch_scaled_normals = _dual_branch_scaled_normals(
+            scaled_normal,
+            radius_ratio=radius_ratios[circle_index],
+            reconstruction_mode=reconstruction_mode,
+        )
+        branch_contours = [contour_points_outer[circle_index]]
+        if reconstruction_mode == "dual_joint":
+            assert contour_points_inner is not None
+            branch_contours.append(contour_points_inner[circle_index])
+
+        for branch_scaled_normal, branch_contour_points in zip(
+            branch_scaled_normals,
+            branch_contours,
+            strict=True,
+        ):
+            for view_index in range(num_views):
+                matrix_m = intrinsics @ Rotation.from_rotvec(pose_rotvecs[view_index]).as_matrix()
+                predicted_dual = _projected_dual_conic_matrix(
+                    center,
+                    branch_scaled_normal,
+                    matrix_m=matrix_m,
+                    camera_center=pose_centers[view_index],
                 )
-            )
+                point_conic = _point_conic_from_dual(predicted_dual)
+                residuals.append(
+                    _sampson_point_residuals(
+                        point_conic,
+                        branch_contour_points[view_index],
+                        point_sigma=point_sigma,
+                    )
+                )
 
     return np.concatenate(residuals, axis=0)
 
@@ -486,20 +557,37 @@ def _joint_raw_circle_residuals(
     pose_centers: np.ndarray,
     pose_rotvecs: np.ndarray,
     intrinsics: np.ndarray,
-    observed_duals: np.ndarray,
+    observed_duals_outer: np.ndarray,
+    observed_duals_inner: np.ndarray | None,
+    radius_ratio: float,
+    reconstruction_mode: str,
 ) -> np.ndarray:
     center = np.asarray(circle_state[:3], dtype=np.float64)
     scaled_normal = np.asarray(circle_state[3:], dtype=np.float64)
     residuals = []
-    for view_index in range(pose_centers.shape[0]):
-        matrix_m = intrinsics @ Rotation.from_rotvec(pose_rotvecs[view_index]).as_matrix()
-        predicted_dual = _projected_dual_conic_matrix(
-            center,
-            scaled_normal,
-            matrix_m=matrix_m,
-            camera_center=pose_centers[view_index],
-        )
-        residuals.append(_vec5_from_dual_conic_matrix(predicted_dual) - predicted_dual[2, 2] * observed_duals[view_index])
+    branch_scaled_normals = _dual_branch_scaled_normals(
+        scaled_normal,
+        radius_ratio=radius_ratio,
+        reconstruction_mode=reconstruction_mode,
+    )
+    branch_observed_duals = [np.asarray(observed_duals_outer, dtype=np.float64)]
+    if reconstruction_mode == "dual_joint":
+        if observed_duals_inner is None:
+            raise ValueError("inner dual observations are required for dual_joint reconstruction")
+        branch_observed_duals.append(np.asarray(observed_duals_inner, dtype=np.float64))
+
+    for branch_scaled_normal, branch_observed in zip(branch_scaled_normals, branch_observed_duals, strict=True):
+        for view_index in range(pose_centers.shape[0]):
+            matrix_m = intrinsics @ Rotation.from_rotvec(pose_rotvecs[view_index]).as_matrix()
+            predicted_dual = _projected_dual_conic_matrix(
+                center,
+                branch_scaled_normal,
+                matrix_m=matrix_m,
+                camera_center=pose_centers[view_index],
+            )
+            residuals.append(
+                _vec5_from_dual_conic_matrix(predicted_dual) - predicted_dual[2, 2] * branch_observed[view_index]
+            )
     return np.concatenate(residuals, axis=0)
 
 
@@ -508,14 +596,34 @@ def reconstruct_scene(
     ellipse_results: list[list[EllipseFitResult]],
     camera_center_sigma: float,
     refinement_mode: str = "algebraic_then_geometric",
+    reconstruction_mode: str = "outer_only",
+    inner_ellipse_results: list[list[EllipseFitResult]] | None = None,
 ) -> list[ReconstructionResult]:
     if refinement_mode not in {"algebraic_only", "geometric_only", "algebraic_then_geometric"}:
         raise ValueError(
             "refinement_mode must be 'algebraic_only', 'geometric_only', or 'algebraic_then_geometric'"
         )
+    if reconstruction_mode not in {"outer_only", "dual_joint"}:
+        raise ValueError("reconstruction_mode must be 'outer_only' or 'dual_joint'")
     num_circles = len(ellipse_results)
     if num_circles == 0:
         return []
+    num_views = int(np.asarray(scene.observations["camera_centers_noisy"], dtype=np.float64).shape[0])
+    _validate_ellipse_result_layout(
+        ellipse_results,
+        num_circles=num_circles,
+        num_views=num_views,
+        label="ellipse_results",
+    )
+    if reconstruction_mode == "dual_joint":
+        if inner_ellipse_results is None:
+            raise ValueError("inner_ellipse_results are required for dual_joint reconstruction")
+        _validate_ellipse_result_layout(
+            inner_ellipse_results,
+            num_circles=num_circles,
+            num_views=num_views,
+            label="inner_ellipse_results",
+        )
 
     intrinsics = np.asarray(scene.cameras["intrinsics"], dtype=np.float64)
     observed_centers = np.asarray(scene.observations["camera_centers_noisy"], dtype=np.float64)
@@ -523,24 +631,47 @@ def reconstruct_scene(
     pose_covariances = np.asarray(scene.observations.get("pose_covariances"), dtype=np.float64)
     if pose_covariances.ndim != 3 or pose_covariances.shape[1:] != (6, 6):
         raise ValueError("scene observations must include pose_covariances with shape (num_views, 6, 6)")
-    num_views = observed_centers.shape[0]
-    contour_points = np.asarray(scene.observations["contour_points"], dtype=np.float64)
+    contour_points_outer = np.asarray(scene.observations["contour_points"], dtype=np.float64)
+    contour_points_inner = None
+    if reconstruction_mode == "dual_joint":
+        contour_points_inner = np.asarray(scene.observations["contour_points_inner"], dtype=np.float64)
     point_sigma = float(scene.metadata.get("local_simulation_choices", {}).get("contour_noise_sigma", 1.0))
+    outer_radii = np.asarray(scene.circles["outer_radii"], dtype=np.float64)
+    inner_radii = np.asarray(scene.circles["inner_radii"], dtype=np.float64)
+    radius_ratios = inner_radii / np.maximum(outer_radii, 1e-12)
 
-    observed_duals = np.asarray(
+    observed_duals_outer = np.asarray(
         [
             [np.asarray(result.dual_conic_vec5, dtype=np.float64) for result in circle_results]
             for circle_results in ellipse_results
         ],
         dtype=np.float64,
     )
-    dual_covariances = np.asarray(
+    dual_covariances_outer = np.asarray(
         [
             [np.asarray(result.dual_conic_covariance, dtype=np.float64) for result in circle_results]
             for circle_results in ellipse_results
         ],
         dtype=np.float64,
     )
+    observed_duals_inner = None
+    dual_covariances_inner = None
+    if reconstruction_mode == "dual_joint":
+        assert inner_ellipse_results is not None
+        observed_duals_inner = np.asarray(
+            [
+                [np.asarray(result.dual_conic_vec5, dtype=np.float64) for result in circle_results]
+                for circle_results in inner_ellipse_results
+            ],
+            dtype=np.float64,
+        )
+        dual_covariances_inner = np.asarray(
+            [
+                [np.asarray(result.dual_conic_covariance, dtype=np.float64) for result in circle_results]
+                for circle_results in inner_ellipse_results
+            ],
+            dtype=np.float64,
+        )
 
     center_whiteners = np.asarray(
         [_inverse_sqrt(_project_psd(pose_covariances[view_index, :3, :3] + 1e-12 * np.eye(3))) for view_index in range(num_views)],
@@ -550,16 +681,29 @@ def reconstruct_scene(
         [_inverse_sqrt(_project_psd(pose_covariances[view_index, 3:, 3:] + 1e-12 * np.eye(3))) for view_index in range(num_views)],
         dtype=np.float64,
     )
-    dual_whiteners = np.asarray(
+    dual_whiteners_outer = np.asarray(
         [
             [
-                _inverse_sqrt(_project_psd(dual_covariances[circle_index, view_index] + 1e-12 * np.eye(5)))
+                _inverse_sqrt(_project_psd(dual_covariances_outer[circle_index, view_index] + 1e-12 * np.eye(5)))
                 for view_index in range(num_views)
             ]
             for circle_index in range(num_circles)
         ],
         dtype=np.float64,
     )
+    dual_whiteners_inner = None
+    if reconstruction_mode == "dual_joint":
+        assert dual_covariances_inner is not None
+        dual_whiteners_inner = np.asarray(
+            [
+                [
+                    _inverse_sqrt(_project_psd(dual_covariances_inner[circle_index, view_index] + 1e-12 * np.eye(5)))
+                    for view_index in range(num_views)
+                ]
+                for circle_index in range(num_circles)
+            ],
+            dtype=np.float64,
+        )
 
     initial_circle_states = np.asarray(
         [_initial_state_from_scene(scene, circle_index, circle_ellipse_results) for circle_index, circle_ellipse_results in enumerate(ellipse_results)],
@@ -589,10 +733,14 @@ def reconstruct_scene(
                 intrinsics=intrinsics,
                 observed_centers=observed_centers,
                 observed_rotvecs=observed_rotvecs,
-                observed_duals=observed_duals,
+                observed_duals_outer=observed_duals_outer,
+                observed_duals_inner=observed_duals_inner,
+                radius_ratios=radius_ratios,
+                reconstruction_mode=reconstruction_mode,
                 center_whiteners=center_whiteners,
                 rotation_whiteners=rotation_whiteners,
-                dual_whiteners=dual_whiteners,
+                dual_whiteners_outer=dual_whiteners_outer,
+                dual_whiteners_inner=dual_whiteners_inner,
             ),
             x0=x0,
             bounds=(lower_bounds, upper_bounds),
@@ -612,7 +760,10 @@ def reconstruct_scene(
                 intrinsics=intrinsics,
                 observed_centers=observed_centers,
                 observed_rotvecs=observed_rotvecs,
-                contour_points=contour_points,
+                contour_points_outer=contour_points_outer,
+                contour_points_inner=contour_points_inner,
+                radius_ratios=radius_ratios,
+                reconstruction_mode=reconstruction_mode,
                 point_sigma=point_sigma,
                 center_whiteners=center_whiteners,
                 rotation_whiteners=rotation_whiteners,
@@ -680,7 +831,10 @@ def reconstruct_scene(
                     pose_centers=np.asarray(adjusted_centers, dtype=np.float64),
                     pose_rotvecs=np.asarray(adjusted_rotvecs, dtype=np.float64),
                     intrinsics=intrinsics,
-                    observed_duals=observed_duals[circle_index],
+                    observed_duals_outer=observed_duals_outer[circle_index],
+                    observed_duals_inner=None if observed_duals_inner is None else observed_duals_inner[circle_index],
+                    radius_ratio=radius_ratios[circle_index],
+                    reconstruction_mode=reconstruction_mode,
                 ),
             )
         )
